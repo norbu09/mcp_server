@@ -2,62 +2,58 @@
 
 ## 1. Current Work Focus
 
-The immediate next step is to establish a basic test suite for the `mcp_server` library, focusing initially on the `mcp_server_demo` application to ensure end-to-end functionality. This will involve:
+With the `mcp_server_demo` test suite now passing after a significant refactoring of the JSON-RPC request/response handling in the core `mcp_server` library, the primary focus shifts towards:
 
-*   Setting up basic test helpers.
-*   Writing a test for the `MCPServerDemo.EchoHandler` through the `MCPServer.Plug` to verify:
-    *   Successful request-response cycle for a known MCP method (e.g., `mcp/listResources`).
-    *   Correct JSON-RPC request parsing and response formatting.
-    *   Handler `init/2` and the specific method callback (e.g., `list_resources/3`) are invoked.
-
-Once the demo app has a basic test, we will expand testing to cover individual components of the `mcp_server` library more directly (e.g., unit tests for `MCPServer.Connection` logic, `MCPServer.Implementation` default functions).
+*   **Comprehensive Unit Testing for `mcp_server`:**
+    *   Thoroughly test `MCPServer.Connection` logic in isolation (method dispatch, state transitions, all MCP method handling, error conditions).
+    *   Test `MCPServer.Plug` for request parsing, response generation, options handling, and error paths (e.g., invalid HTTP methods, body read errors).
+    *   Verify default implementations in `MCPServer.Implementation`.
+*   **Documentation:**
+    *   Begin writing `@moduledoc` and `@doc` for all public modules and functions in `mcp_server`.
+    *   Draft an initial `README.md` for the `mcp_server` library.
 
 ## 2. Recent Changes Summary
 
-*   **Core Library Implemented:** `MCPServer.Plug`, `MCPServer.Implementation` (behaviour), `MCPServer.Connection` (GenServer), and `MCPServer.Context` (struct) have been created and refined.
-*   **JSON Handling:** Switched from Jason to the standard library `JSON` module (Elixir 1.18+).
-*   **`MCPServer.Context`:** Introduced this struct to provide richer, structured context to handler callbacks. It includes selected details from `Plug.Conn` rather than the full `Plug.Conn` object.
-*   **Demo Project (`mcp_server_demo`):**
-    *   Created with an `MCPServerDemo.EchoHandler` and an `Application` module to run Bandit with the `MCPServer.Plug`.
-    *   Successfully compiles and serves as a basic integration testbed.
-*   **Typespecs & Warnings:** Addressed various typespec issues and compiler warnings. Some typespecs (like `Plug.Conn.t()`) were simplified for pragmatic reasons.
-*   **`MCPServer.Implementation` Defaults:** Corrected the `defoverridable` list in the `__using__/1` macro to only include functions with actual default implementations, fixing compilation issues in the demo.
+*   **JSON-RPC Refactoring (`MCPServer.Connection` & `MCPServer.Plug`):**
+    *   `MCPServer.Connection` now uses helper functions (`genserver_reply_success/4`, `genserver_reply_error/3`) to ensure consistent and correct JSON-RPC response formatting for all MCP methods. This resolved issues where payloads were not matching `MCPServer.Plug`'s sending clauses.
+    *   The structure of the `mcp/initialize` response was corrected to nest capabilities under `\"serverCapabilities\"` and include a `\"sessionId\"` (even if nil).
+    *   Error handling in `MCPServer.Plug` for `Plug.Conn.read_body/1` was simplified and made more robust.
+    *   An unused `error_resp/4` function was removed from `MCPServer.Connection`.
+*   **Test Suite Success (`mcp_server_demo`):**
+    *   The test suite in `mcp_server_demo` (both `echo_handler_test.exs` and `echo_handler_integration_test.exs`) is now fully passing.
+    *   Assertions were updated to match the corrected response structures (e.g., string keys from JSON decoding, correct nesting of results for list operations, proper `mcp/initialize` response format).
+*   **Core Library Implemented:** `MCPServer.Plug`, `MCPServer.Implementation` (behaviour), `MCPServer.Connection` (GenServer), and `MCPServer.Context` (struct) form a stable base.
+*   **JSON Handling:** Uses the standard library `JSON` module.
+*   **`MCPServer.Context`:** Provides structured context to handler callbacks.
 
 ## 3. Next Steps (High-Level)
 
-1.  **Test Suite for `mcp_server_demo` (Current Focus):** Verify basic end-to-end functionality.
-2.  **Unit Tests for `mcp_server` library:**
-    *   Test `MCPServer.Connection` logic in isolation (method dispatch, state transitions, error handling).
-    *   Test `MCPServer.Plug` request handling and response generation.
-    *   Test default implementations in `MCPServer.Implementation`.
-3.  **Documentation:**
-    *   Write comprehensive `@moduledoc` and `@doc` for all public modules and functions.
-    *   Create a `README.md` for the `mcp_server` library with usage instructions and examples.
-    *   Review and update `docs/mcp_server_elixir_design.md`.
-4.  **Credo Integration:** Add and configure `credo` for static code analysis.
-5.  **Refinements & Advanced Features (Post-MVP):**
+1.  **Comprehensive Unit Tests for `mcp_server` library (Current Focus).**
+2.  **Core Documentation (`@moduledoc`, `@doc`, `README.md`) (Current Focus).**
+3.  **Credo Integration:** Add and configure `credo` for static code analysis.
+4.  **Refinements & Advanced Features (Post-MVP):**
     *   Consider WebSocket support.
     *   Consider batch JSON-RPC request support.
-    *   More robust error handling and logging.
+    *   More robust error handling and logging (e.g., specific error data payloads).
 
 ## 4. Active Decisions & Considerations
 
-*   **Testing Strategy:** Start with integration-style tests via the demo app, then add more focused unit tests for library components. This ensures the primary user workflow is covered early.
-*   **`Plug.Conn` in Context:** The decision to pass a map of selected `Plug.Conn` details to `MCPServer.Context.plug_conn` instead of the full `conn` is firm, for security and state management reasons.
-*   **GenServer Lifecycle:** Currently, `MCPServer.Plug` starts a new `MCPServer.Connection` GenServer for each HTTP request. This is simple but might not be suitable for MCP features that imply a longer-lived session without a client-provided session identifier. For now, this is deemed sufficient for MVP.
-*   **Error Object Granularity:** The `@type error_object :: map()` in `MCPServer.Implementation` is broad. We may refine this to a more specific struct or map shape as we define standard error codes/structures for the library.
+*   **Testing Strategy:** Having established end-to-end viability with the demo app's tests, the focus is now on granular unit tests for the library itself to ensure robustness and cover edge cases.
+*   **`Plug.Conn` in Context:** The decision to pass a map of selected `Plug.Conn` details remains.
+*   **GenServer Lifecycle:** Current model (GenServer per request) is sufficient for now.
+*   **Dialyzer Warning in `MCPServer.Plug`:** The warning about `Plug.Conn.read_body/1` pattern matching is noted but deemed acceptable for now as functionality is correct.
 
 ## 5. Important Patterns & Preferences
 
-*   **Clarity and Simplicity:** Prefer straightforward Elixir code. Use pattern matching effectively.
-*   **Explicit Error Handling:** Use `{:ok, ...}` and `{:error, ...}` tuples. Avoid raising exceptions for flow control.
-*   **Immutability:** Embrace Elixir's immutable data structures.
-*   **Test-Driven (Aspirational):** While not strictly TDD, write tests alongside or shortly after feature implementation.
-*   **Minimal Dependencies:** Stick to Elixir core and essential libraries like Plug.
+*   **Clarity and Simplicity.**
+*   **Explicit Error Handling (`{:ok, ...}`, `{:error, ...}`).**
+*   **Immutability.**
+*   **Test-Driven (Aspirational).**
+*   **Minimal Dependencies.**
 
 ## 6. Learnings & Project Insights
 
-*   **Typespecs can be tricky:** Especially with external libraries or complex data structures. Pragmatism is needed; sometimes a slightly less precise typespec is better than a persistent compiler error if the underlying code is sound.
-*   **`defoverridable` requires care:** Ensure that only functions with default implementations provided by the module using `defoverridable` are listed.
-*   **Demo applications are invaluable:** They serve as the first line of integration testing and highlight issues that unit tests for isolated components might miss.
-*   **Iterative Refinement:** The design (e.g., introduction of `MCPServer.Context`) evolves as implementation details are worked through. 
+*   **Iterative Refinement is Key:** The process of getting the demo tests to pass highlighted several areas for improvement in the core library's response handling and data structuring.
+*   **Test Suites Drive Quality:** A good test suite is invaluable for uncovering subtle bugs and ensuring refactoring doesn't break existing functionality.
+*   **Clear Separation of Concerns:** The `Plug` (HTTP interface), `Connection` (session/state logic), and `Implementation` (user logic) model is working well.
+*   Typespecs, `defoverridable`, and careful handling of JSON key types (string vs. atom) continue to be important details. 
