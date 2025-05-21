@@ -6,9 +6,13 @@ defmodule MCPServer.Connection do
   `MCPServer.Implementation` behaviour) to process incoming MCP requests.
   """
   use GenServer
+  require Logger # Added Logger
 
   # alias MCPServer.Implementation # Removed unused alias
   alias MCPServer.Context
+
+  @notification_methods [] # Define as empty list for now
+  @timeout 5000 # Default timeout for GenServer calls
 
   # Define the state for this GenServer
   # The user's MCP implementation module
@@ -35,8 +39,35 @@ defmodule MCPServer.Connection do
   @doc """
   Processes a JSON-RPC request map, including details from the Plug connection.
   """
-  def process_request(pid, json_rpc_request, plug_details) do
-    GenServer.call(pid, {:process_request, json_rpc_request, plug_details})
+  def process_request(pid, conn_details_map, request_body_map) do
+    try do
+      # If handle_call returns {:reply, payload_for_client, _new_state},
+      # GenServer.call returns payload_for_client.
+      # This payload_for_client can be a success map or an error map (from error_resp in handle_call).
+      payload_from_genserver = GenServer.call(pid, {:process_request, conn_details_map, request_body_map}, @timeout)
+      {:ok, payload_from_genserver} # Plug expects {:ok, payload} for successful processing by Connection
+    rescue
+      e -> # Catches GenServer crashes or timeouts
+        Logger.error("[MCPServer.Connection] GenServer.call failed: #{inspect(e)}")
+        # Try to get the original request ID if possible, for the error response
+        original_request_id =
+          if is_map(request_body_map) do
+            Map.get(request_body_map, "id", Map.get(request_body_map, :id)) # check string then atom key
+          else
+            nil
+          end
+
+        error_payload = %{
+          "jsonrpc" => "2.0",
+          "id" => original_request_id,
+          "error" => %{
+            "code" => -32000, # Generic server error for GenServer failure
+            "message" => "Internal server error: #{e.__struct__}" # Just the error type for security
+          }
+        }
+        # This signifies that the Connection itself had an issue, not an application-level JSON-RPC error.
+        {:error, error_payload} # Plug expects {:error, payload} if Plug itself cannot get a response from Connection
+    end
   end
 
   # --- GenServer Callbacks ---
@@ -78,165 +109,149 @@ defmodule MCPServer.Connection do
   end
 
   @impl GenServer
-  def handle_call({:process_request, json_rpc_request, plug_details}, _from, state) do
-    # Extract method, params, and id from the JSON-RPC request
-    # MCP methods are namespaced, e.g., "mcp/listResources"
-    # We need to map these to our behaviour callbacks.
+  def handle_call({:process_request, conn_details_map, request_body_map}, _from, state) do
+    Logger.debug("[Connection.handle_call] Received request_body_map: #{inspect(request_body_map)} -- Keys: #{inspect(Map.keys(request_body_map))}")
 
-    method = Map.get(json_rpc_request, "method")
-    # Default to empty map if no params
-    params = Map.get(json_rpc_request, "params", %{})
-    # Can be nil for notifications
-    request_id = Map.get(json_rpc_request, "id")
+    jsonrpc_version = Map.get(request_body_map, "jsonrpc")
+    mcp_method_name = Map.get(request_body_map, "method")
+    request_id_from_body = Map.get(request_body_map, "id")
+    params = Map.get(request_body_map, "params", %{})
 
-    # Create the context for the handler call
-    context = %Context{
+    Logger.debug("[Connection.handle_call] Extracted jsonrpc: #{inspect(jsonrpc_version)}, method: #{inspect(mcp_method_name)}, id: #{inspect(request_id_from_body)}")
+
+    context = %MCPServer.Context{
       connection_pid: self(),
-      request_id: request_id,
+      plug_conn: conn_details_map,
+      request_id: request_id_from_body,
       client_capabilities: state.client_capabilities,
-      plug_conn: plug_details # Use the passed plug_details here
+      custom_data: %{} # Initialize with empty custom_data
     }
 
-    response_tuple =
-      case method do
-        # --- Standard MCP Methods ---
+    # Perform validations first
+    validated_response_tuple =
+      cond do
+        jsonrpc_version != "2.0" ->
+          genserver_reply_error(request_id_from_body, %{code: -32600, message: "Invalid Request: JSON-RPC version must be 2.0"}, state)
+
+        is_nil(mcp_method_name) ->
+          genserver_reply_error(request_id_from_body, %{code: -32600, message: "Invalid Request: method not specified"}, state)
+
+        is_nil(request_id_from_body) and not Enum.member?(@notification_methods, mcp_method_name) ->
+          genserver_reply_error(nil, %{code: -32602, message: "Invalid Request: id is required for this method"}, state)
+
+        true ->
+          # All basic validations passed, proceed to method-specific handling
+          :proceed_to_dispatch
+      end
+
+    if validated_response_tuple == :proceed_to_dispatch do
+      # Dispatch to the specific method handler
+      case mcp_method_name do
         "mcp/initialize" ->
-          # The "initialize" request in MCP is special. It's where client capabilities are sent.
-          # It expects server capabilities in return.
           client_caps_param = Map.get(params, "capabilities", %{})
-          # For mcp/initialize, the context passed to handle_client_capabilities
-          # should not yet have the client_capabilities being set from *this* request.
-          # It uses the ones already in the GenServer state (which is nil before first initialize).
-          # The new client_caps are then stored in GenServer state *after* this call.
-          init_context = %Context{
-            connection_pid: self(),
-            request_id: request_id,
-            client_capabilities: state.client_capabilities, # existing (nil on first call)
-            plug_conn: plug_details
-          }
-          handle_mcp_initialize(init_context, client_caps_param, request_id, state)
+          handle_mcp_initialize(context, client_caps_param, request_id_from_body, state)
 
         "mcp/listResources" ->
-          state.handler_module.list_resources(context, params, state.handler_state)
+          case state.handler_module.list_resources(context, params, state.handler_state) do
+            {:reply, data, new_handler_state} -> genserver_reply_success(request_id_from_body, mcp_method_name, data, %{state | handler_state: new_handler_state})
+            {:error, error_obj, new_handler_state} -> genserver_reply_error(request_id_from_body, error_obj, %{state | handler_state: new_handler_state})
+            other -> handle_unexpected_handler_return(other, request_id_from_body, mcp_method_name, state)
+          end
 
         "mcp/getResource" ->
-          # Assuming params include an "id" for the resource
-          # Basic extraction, might need more robust parsing
           resource_id = Map.get(params, "id")
-
           if resource_id do
-            state.handler_module.get_resource(context, resource_id, params, state.handler_state)
+            case state.handler_module.get_resource(context, resource_id, params, state.handler_state) do
+              {:reply, data, new_handler_state} -> genserver_reply_success(request_id_from_body, mcp_method_name, data, %{state | handler_state: new_handler_state})
+              {:error, error_obj, new_handler_state} -> genserver_reply_error(request_id_from_body, error_obj, %{state | handler_state: new_handler_state})
+              other -> handle_unexpected_handler_return(other, request_id_from_body, mcp_method_name, state)
+            end
           else
-            # Missing resource id for getResource
-            {:error,
-             %{code: -32602, message: "Invalid params: missing resource id for mcp/getResource"},
-             state.handler_state}
+            genserver_reply_error(request_id_from_body, %{code: -32602, message: "Invalid params: missing resource id for mcp/getResource"}, state)
           end
 
         "mcp/listPrompts" ->
-          state.handler_module.list_prompts(context, params, state.handler_state)
+          case state.handler_module.list_prompts(context, params, state.handler_state) do
+            {:reply, data, new_handler_state} -> genserver_reply_success(request_id_from_body, mcp_method_name, data, %{state | handler_state: new_handler_state})
+            {:error, error_obj, new_handler_state} -> genserver_reply_error(request_id_from_body, error_obj, %{state | handler_state: new_handler_state})
+            other -> handle_unexpected_handler_return(other, request_id_from_body, mcp_method_name, state)
+          end
 
         "mcp/getPrompt" ->
           prompt_id = Map.get(params, "id")
-
           if prompt_id do
-            state.handler_module.get_prompt(context, prompt_id, params, state.handler_state)
+            case state.handler_module.get_prompt(context, prompt_id, params, state.handler_state) do
+              {:reply, data, new_handler_state} -> genserver_reply_success(request_id_from_body, mcp_method_name, data, %{state | handler_state: new_handler_state})
+              {:error, error_obj, new_handler_state} -> genserver_reply_error(request_id_from_body, error_obj, %{state | handler_state: new_handler_state})
+              other -> handle_unexpected_handler_return(other, request_id_from_body, mcp_method_name, state)
+            end
           else
-            {:error,
-             %{code: -32602, message: "Invalid params: missing prompt id for mcp/getPrompt"},
-             state.handler_state}
+            genserver_reply_error(request_id_from_body, %{code: -32602, message: "Invalid params: missing prompt id for mcp/getPrompt"}, state)
           end
 
         "mcp/listTools" ->
-          state.handler_module.list_tools(context, params, state.handler_state)
-
-        "mcp/executeTool" ->
-          # Or just "id" - check MCP spec carefully for tool execution params
-          tool_id = Map.get(params, "toolId")
-          # Accommodate common variations
-          tool_params = Map.get(params, "toolInputs", Map.get(params, "params"))
-
-          if tool_id && tool_params do
-            state.handler_module.execute_tool(context, tool_id, tool_params, state.handler_state)
-          else
-            {:error,
-             %{
-               code: -32602,
-               message: "Invalid params: missing toolId or toolInputs for mcp/executeTool"
-             }, state.handler_state}
+          case state.handler_module.list_tools(context, params, state.handler_state) do
+            {:reply, data, new_handler_state} -> genserver_reply_success(request_id_from_body, mcp_method_name, data, %{state | handler_state: new_handler_state})
+            {:error, error_obj, new_handler_state} -> genserver_reply_error(request_id_from_body, error_obj, %{state | handler_state: new_handler_state})
+            other -> handle_unexpected_handler_return(other, request_id_from_body, mcp_method_name, state)
           end
 
-        # TODO: Add more MCP methods like shutdown, etc.
-
-        # Method was not present or was nil
-        nil ->
-          {:error, %{code: -32600, message: "Invalid Request: method not specified"},
-           state.handler_state}
+        "mcp/executeTool" ->
+          tool_id = Map.get(params, "toolId")
+          tool_params = Map.get(params, "toolInputs", Map.get(params, "params"))
+          if tool_id && tool_params do
+            case state.handler_module.execute_tool(context, tool_id, tool_params, state.handler_state) do
+              {:reply, data, new_handler_state} -> genserver_reply_success(request_id_from_body, mcp_method_name, data, %{state | handler_state: new_handler_state})
+              {:error, error_obj, new_handler_state} -> genserver_reply_error(request_id_from_body, error_obj, %{state | handler_state: new_handler_state})
+              other -> handle_unexpected_handler_return(other, request_id_from_body, mcp_method_name, state)
+            end
+          else
+            genserver_reply_error(request_id_from_body, %{code: -32602, message: "Invalid params: missing toolId or toolInputs for mcp/executeTool"}, state)
+          end
+        nil -> # Method name was nil
+          genserver_reply_error(request_id_from_body, %{code: -32600, message: "Invalid Request: method not specified"}, state)
 
         _unknown_method ->
-          # Default for unknown methods
-          error_obj = %{code: -32601, message: "Method not found: #{method}"}
-
-          # Check if it might be a notification (no id) - though MCP spec implies most calls expect response.
-          # For now, assume all unknown methods are errors if they have an ID.
-          {:error, error_obj, state.handler_state}
+          genserver_reply_error(request_id_from_body, %{code: -32601, message: "Method not found: #{mcp_method_name}"}, state)
       end
-
-    # Process the response tuple from the handler callback
-    case response_tuple do
-      {:reply, result_data, new_handler_state} ->
-        response_payload = %{jsonrpc: "2.0", result: result_data, id: request_id}
-        {:reply, response_payload, %{state | handler_state: new_handler_state}}
-
-      {:error, error_object, new_handler_state} ->
-        response_payload = %{jsonrpc: "2.0", error: error_object, id: request_id}
-        {:reply, response_payload, %{state | handler_state: new_handler_state}}
-
-      # Add other cases like :noreply, :stop if handler can return them from these contexts
-      _other ->
-        # Handler returned an unexpected value for a request that expects reply/error
-        default_error = %{
-          code: -32000,
-          message: "Internal server error: Handler returned unexpected value"
-        }
-
-        response_payload = %{jsonrpc: "2.0", error: default_error, id: request_id}
-        # Keep the original handler state as we don't know if it's valid
-        {:reply, response_payload, state}
+    else
+      # One of the validations failed, validated_response_tuple is the GenServer reply
+      validated_response_tuple
     end
   end
 
   # Handle the mcp/initialize method specifically
   defp handle_mcp_initialize(context_for_handler, client_capabilities_param, request_id, state) do
-    # 1. Inform the handler about client capabilities using the passed context
+    # 1. Inform the handler about client capabilities
     case state.handler_module.handle_client_capabilities(context_for_handler, client_capabilities_param, state.handler_state) do
       {:ok, state_after_client_caps} ->
-        response_payload = %{
-          jsonrpc: "2.0",
-          result: %{"capabilities" => state.server_capabilities},
-          id: request_id
+        # Server capabilities were fetched during Connection.init
+        # The result for initialize includes 'serverCapabilities' and 'sessionId'
+        result_data = %{
+          "serverCapabilities" => state.server_capabilities,
+          "sessionId" => nil # Explicitly include sessionId, can be nil
         }
-        # Update GenServer state with the NEW client_capabilities from this request
+        # For mcp/initialize, the result_data *is* the complete result object, not nested further.
+        response_payload = %{
+          "jsonrpc" => "2.0",
+          "result" => result_data,
+          "id" => request_id
+        }
         new_genserver_state = %{state | handler_state: state_after_client_caps, client_capabilities: client_capabilities_param}
         {:reply, response_payload, new_genserver_state}
 
       {:error, error_obj, state_after_client_caps_error} ->
         # Handler failed to process client capabilities
-        response_payload = %{jsonrpc: "2.0", error: error_obj, id: request_id}
-        # Store new state even on error
         new_genserver_state = %{state | handler_state: state_after_client_caps_error}
-        {:reply, response_payload, new_genserver_state}
+        genserver_reply_error(request_id, error_obj, new_genserver_state)
 
-      _other ->
+      other ->
+         Logger.error("[MCPServer.Connection] Unexpected return from handle_client_capabilities: #{inspect(other)}")
         default_error = %{
           code: -32000,
-          message:
-            "Internal server error: Handler returned unexpected value from handle_client_capabilities"
+          message: "Internal server error: Handler returned unexpected value from handle_client_capabilities"
         }
-
-        response_payload = %{jsonrpc: "2.0", error: default_error, id: request_id}
-        # Keep original state
-        {:reply, response_payload, state}
+        genserver_reply_error(request_id, default_error, state) # Keep original GenServer state
     end
   end
 
@@ -257,5 +272,54 @@ defmodule MCPServer.Connection do
     end
 
     :ok
+  end
+
+  # Builds an error response payload (map). Does not form the GenServer reply tuple.
+  # This function is unused.
+  # defp error_resp(id, code, message, data \\\\ nil) do
+  #   payload = %{
+  #     "jsonrpc" => "2.0",
+  #     "id" => id,
+  #     "error" => %{"code" => code, "message" => message}
+  #   }
+  #   if data, do: Map.put(payload["error"], "data", data), else: payload
+  # end
+
+  # --- New Helper Functions ---
+
+  # Helper to build the final GenServer reply for a success case
+  defp genserver_reply_success(request_id, mcp_method_name, handler_result_data, new_genserver_state) do
+    result_object =
+      case mcp_method_name do
+        # "mcp/initialize" is handled by handle_mcp_initialize directly
+        "mcp/listResources" -> %{"resources" => handler_result_data}
+        "mcp/listPrompts" -> %{"prompts" => handler_result_data}
+        "mcp/listTools" -> %{"tools" => handler_result_data}
+        # For methods like getResource, getPrompt, executeTool, the handler_result_data *is* the result object
+        _ -> handler_result_data # This covers getResource, getPrompt, executeTool
+      end
+
+    response = %{
+      "jsonrpc" => "2.0",
+      "result" => result_object,
+      "id" => request_id
+    }
+    {:reply, response, new_genserver_state}
+  end
+
+  # Helper to build the final GenServer reply for an error case
+  defp genserver_reply_error(request_id, handler_error_object, new_genserver_state) do
+    response = %{
+      "jsonrpc" => "2.0",
+      "error" => handler_error_object, # This is %{code: ..., message: ...}
+      "id" => request_id
+    }
+    {:reply, response, new_genserver_state}
+  end
+
+  defp handle_unexpected_handler_return(other_return, request_id, mcp_method_name, state) do
+    Logger.error("[MCPServer.Connection] Unexpected return from handler for #{mcp_method_name}: #{inspect(other_return)}")
+    error_obj = %{code: -32000, message: "Internal server error: Handler returned unexpected value for #{mcp_method_name}"}
+    genserver_reply_error(request_id, error_obj, state) # Keep original GenServer state on unexpected handler return
   end
 end
